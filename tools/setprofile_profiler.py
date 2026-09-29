@@ -50,6 +50,8 @@ def _is_workspace(filename: str) -> bool:
 threads = {}
 write_lock = threading.Lock()
 is_exiting = False
+call_to_id = {} 
+func_sandwich = {}
 
 
 def profile_handler(frame, event, arg):
@@ -67,22 +69,19 @@ def profile_handler(frame, event, arg):
     if event not in ('call', 'return'):
         return
 
-    tid = str(threading.current_thread().ident)
-    if tid not in threads:
-        threads[tid] = {
-            "call_count": 0,
-            "call_to_id": {},
-            "func_count": 0,
-            "graph": {},
-            # "paths": {},
-            "sandwich": {},
-            "stack": [],
-        }
-    data = threads[tid]
-
     with write_lock:
         if is_exiting:
             return
+
+        tid = str(threading.current_thread().ident)
+        if tid not in threads:
+            threads[tid] = {
+                "call_count": 0,
+                "graph": {},
+                # "paths": {},
+                "stack": [],
+            }
+        data = threads[tid]
         
         func_name = frame.f_code.co_name
         func_path = frame.f_code.co_filename
@@ -93,12 +92,11 @@ def profile_handler(frame, event, arg):
             call_timestamp = time.time_ns()
             data["call_count"] += 1
 
-            if func_key not in data["call_to_id"]:
-                data["func_count"] += 1
-                data["call_to_id"][func_key] = data["func_count"]
-            id = data["call_to_id"][func_key]
+            if func_key not in call_to_id:
+                call_to_id[func_key] = len(call_to_id) + 1
+            id = call_to_id[func_key]
 
-            if id not in data["sandwich"]:
+            if id not in func_sandwich:
                 code = ''
                 if func_name != "<module>":
                     try:
@@ -106,8 +104,8 @@ def profile_handler(frame, event, arg):
                     except:
                         code = ''
                 is_external = _ws_prefixes and not _is_workspace(frame.f_code.co_filename)
-                data["sandwich"][id] = {"count": 0, "duration": 0.0, "is_external": is_external, "code": code}
-            data["sandwich"][id]["count"] += 1
+                func_sandwich[id] = {"count": 0, "duration": 0.0, "is_external": is_external, "code": code}
+            func_sandwich[id]["count"] += 1
 
             data["stack"].append((id, call_timestamp))
         elif event in 'return':
@@ -124,7 +122,7 @@ def profile_handler(frame, event, arg):
 
             callee = data["stack"].pop()
             duration = return_timestamp - callee[1]
-            data["sandwich"][callee[0]]["duration"] += duration
+            func_sandwich[callee[0]]["duration"] += duration
 
             if data["stack"]:
                 caller = data["stack"][-1]
@@ -150,14 +148,20 @@ def cleanup():
         graph_csv = [["src_id", "dst_id", "count", "duration_ns"]]
         # paths_csv = [["ids", "count", "duration_ns"]]
 
+        id_to_call = {v: k for k, v in call_to_id.items()}
+        sandwich_csv.extend([id, id_to_call[id][0], id_to_call[id][1], id_to_call[id][2], info["count"], info["duration"], info["is_external"], info["code"]] for id, info in func_sandwich.items())
+
+        # Merge per-thread graphs; IDs are global, so identical edges combine
+        merged = {}
         for data in threads.values():
-            id_to_call = {v: k for k, v in data["call_to_id"].items()}
+            for edge, info in data["graph"].items():
+                m = merged.setdefault(edge, {"count": 0, "duration": 0})
+                m["count"] += info["count"]
+                m["duration"] += info["duration"]
+        graph_csv.extend([edge[0], edge[1], info["count"], info["duration"]] for edge, info in merged.items())
 
-            sandwich_csv.extend([id, id_to_call[id][0], id_to_call[id][1], id_to_call[id][2], info["count"], info["duration"], info["is_external"], info["code"]] for id, info in data["sandwich"].items())
-            sandwich_writer.writerows(sandwich_csv)
-
-            graph_csv.extend([edge[0], edge[1], info["count"], info["duration"]] for edge, info in data["graph"].items())
-            graph_writer.writerows(graph_csv)
+        sandwich_writer.writerows(sandwich_csv)
+        graph_writer.writerows(graph_csv)
 
             # paths_csv.extend(["->".join(str(node[0]) for node in chain), info["count"], info["duration"]] for chain, info in data["paths"].items())
             # paths_writer.writerows(paths_csv)
